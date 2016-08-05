@@ -1,0 +1,337 @@
+#! /usr/bin/env tclsh
+
+exec stty raw -echo
+fconfigure stdin -blocking 0
+set linebuffer {}
+set currentSock {}
+array set sockAddr {}
+
+set history {}
+set historyLevel -1
+
+proc handleHistory {x} {
+	set hlen [llength $::history]
+	incr ::historyLevel $x
+	if {$::historyLevel > -1} {
+		set ::linebuffer [lindex $::history end-$::historyLevel]
+	}
+	if {$::historyLevel <= -1} {
+		set ::historyLevel -1
+		set ::linebuffer
+	} elseif {$::historyLevel > $hlen} {
+		set ::historyLevel $hlen
+	}
+	putsPrompt
+}
+
+proc appendHistory {cmdline} {
+	set ::historyLevel -1
+	set old [lsearch -exact $::history $cmdline]
+	if {$old != -1} {
+		set ::history [lreplace $::history $old $old]
+	}
+	lappend ::history $cmdline
+}
+
+proc ESC {} {return \033}
+
+proc ANSI {args} {
+	# Support list and args conventions:
+	if {[llength $args] == 1 && [llength [lindex $args 0]] > 1} {
+		set args [lindex $args 0]
+	}
+	set ret "\033\["
+	foreach {op val} $args {
+		switch -- $op {
+			-style {}
+			-bg {append ret 4}
+			-fg {append ret 3}
+		}
+		switch -- $val {
+			black     {append ret "0;"}
+			red       {append ret "1;"}
+			green     {append ret "2;"}
+			yellow    {append ret "3;"}
+			blue      {append ret "4;"}
+			magenta   {append ret "5;"}
+			cyan      {append ret "6;"}
+			white     {append ret "7;"}
+			none      {append ret "0;"}
+			bright    {append ret "1;"}
+			dim       {append ret "2;"}
+			underline {append ret "4;"}
+			blink     {append ret "5;"}
+			reverse   {append ret "7;"}
+		}
+	}
+	set ret [string trim $ret ";"]
+	return ${ret}m
+}
+
+proc -bg {args} {
+	ANSI -bg {*}$args
+}
+
+proc -fg {args} {
+	ANSI -fg {*}$args
+}
+
+proc -style {args} {
+	ANSI -style {*}$args
+}
+
+proc clearline {} {
+	return "\u001b\[2K\r"
+}
+
+proc prompt {} {
+	return "[clearline]$::currentSock-> $::linebuffer"
+}
+
+proc putsPrompt {} {
+	puts -nonewline [prompt]
+	flush stdout
+}
+
+proc putsLine {txt} {
+	set txt [string trimright $txt \n]
+	puts -nonewline "[clearline]$txt\n[prompt]"
+	flush stdout
+}
+
+fileevent stdin readable {
+	set char [read stdin 1]
+	puts -nonewline $char
+	flush stdout
+	if {
+		[string is print $char] ||
+		$char == "\t" ||
+		$char == "\n" ||
+		$char == "\r"
+	} {
+		append ::linebuffer $char
+		
+		if {[regexp -- {^(.*)\n\s*$} $::linebuffer -> line]} {
+			set ::linebuffer {}
+			if {
+				[regexp -- {^/(\S+)\s+(.*)$} $line -> sock message] &&
+				[file channels $sock] != ""
+			} {
+				puts $sock $message
+				flush $sock
+			} elseif {[string trim $line] != ""} {
+				commands {*}$line
+			} else {
+                unknownCommands
+            }
+			
+			appendHistory $line
+			putsPrompt
+		}
+	} else {
+		handleControls $char
+	}
+}
+
+namespace eval commands {
+	proc /exit {args} {
+		doExit
+	}
+	
+	proc /close {args} {
+		set sock [lindex $args 0]
+		if {$sock eq ""} {
+			set sock $::currentSock
+		}
+		closeSock $sock
+	}
+	
+	proc /error {args} {
+		# To test proper handling of bgerror:
+		error $args
+	}
+	
+	proc /switch {args} {
+		set sock [lindex $args 0]
+		if {
+			[file channels $sock] != "" &&
+			[regexp {sock|file} $sock]
+		} {
+			set ::currentSock $sock
+		}
+	}
+	
+	proc /list {args} {
+		foreach sock [file channels] {
+			if {
+                [regexp {sock|file} $sock] &&
+                [info exists ::sockAddr($sock)]
+            } {
+                set str "$sock $::sockAddr($sock)"
+                if {$sock eq $::currentSock} {
+                    append str " (current)"
+                }
+                puts $str
+            }
+		}
+	}
+    
+    proc /fconfigure {args} {
+        fconfigure $::currentSock {*}$args
+    }
+	
+	proc /help {args} {
+		puts [regsub -lineanchor -all -- {^\s+} {
+			Available commands:
+			/exit               - terminate this program
+			/list               - list all open sockets
+			/switch <socket>    - change current socket
+			/close <socket>     - terminate socket connection
+			/<socket> <text...> - send text to socket
+			<text...>           - send text to current socket
+		} {}]
+	}
+    
+    namespace ensemble create -unknown ::unknownWrapper
+    namespace export /*
+}
+
+proc unknownWrapper {ignore cmd args} {
+    return [list ::unknownCommands $cmd]
+}
+
+proc unknownCommands {args} {
+	if {$::currentSock ne {}} {
+		if {[file channels $::currentSock] != ""} {
+			puts $::currentSock $args
+			flush $::currentSock
+		}
+	}
+}
+
+proc handleControls {char} {
+	switch -exact -- $char {
+		\u0003 { ;# ^c
+			doExit
+		}
+		\u0008 -
+		\u007f { ;# ^h && backspace ?
+			handleDelete
+		}
+		\u001b { ;# ESC - handle escape sequences
+			handleEscapes
+		}
+	}
+}
+
+proc handleEscapes {} {
+	set seq [read stdin]
+	switch -exact -- $seq {
+		"\[3~" { ;# delete
+			handleDelete
+		}
+		"\[A" { ;# Cursor Up (cuu1,up)
+			handleHistory 1
+		}
+		"\[B" { ;# Cursor Down
+			handleHistory -1
+		}
+	}
+}
+
+proc handleDelete {} {
+	set ::linebuffer [string range $::linebuffer 0 end-1]
+	putsPrompt
+}
+
+proc doExit {} {
+	puts ""
+	exec stty -raw echo
+	exit
+}
+
+proc bgerror {args} {
+	puts $::errorInfo
+	doExit
+}
+
+proc closeSock {sock} {
+	if {[file channels $sock] != "" && [regexp {sock|file} $sock]} {
+		putsLine "[-bg yellow -fg black]closing connection $sock [-style none]"
+		close $sock
+		unset ::sockAddr($sock)
+	}
+	if {![isServer]} {
+		doExit
+	}
+	if {$sock eq $::currentSock} {
+		set ::currentSock {}
+		putsPrompt
+	}
+}
+
+proc dumpTag {chan} {
+	return "[-style reverse]$chan<-[-style none] "
+}
+
+proc dump {chan addr port} {
+	set raw [string trimright [read $chan] \n]
+	putsLine [dumpTag $chan][join [split $raw \n] \n[dumpTag $chan]]
+	if {[eof $chan]} {
+		closeSock $chan
+	}
+}
+
+proc listen {chan addr port} {
+	putsLine "[-bg green -fg black]new connection $chan [-style none]"
+	fconfigure $chan -blocking 0 -buffering line
+	fileevent $chan readable [list dump $chan $addr $port]
+	set ::sockAddr($chan) $addr
+	if {$::currentSock eq {}} {
+		set ::currentSock $chan
+		putsPrompt
+	}
+}
+
+proc isServer {} {
+	regexp -- {-server} [lindex $::argv 0]
+}
+
+proc init {argv} {
+	if {[isServer]} {
+		set port [lindex $argv 1]
+		if {![regexp {^\d+$} $port]} {
+			set port 6668
+		}
+		socket -server listen $port
+		putsLine "[-bg cyan -fg black]server listening on port $port [-style none]"
+	} elseif {[llength $argv] == 2} {
+		lassign $argv addr port
+		set chan [socket $addr $port]
+		putsLine "[-bg cyan -fg black]new connection $chan [-style none]"
+		fconfigure $chan -blocking 0 -buffering line
+		fileevent $chan readable [list dump $chan $addr $port]
+		set ::sockAddr($chan) $addr
+		set ::currentSock $chan
+	} elseif {[llength $argv] == 1} {
+		set dev [lindex $argv 0]
+		if {[catch {open $dev r+} chan]} {
+            puts stderr "error in opening $dev"
+            doExit
+        }
+		putsLine "[-bg cyan -fg black]opened device $chan [-style none]"
+		fconfigure $chan -blocking 0 -buffering line
+		fileevent $chan readable [list dump $chan $dev {}]
+		set ::sockAddr($chan) $dev
+		set ::currentSock $chan
+	} else {
+		puts stderr "must either specify address and port or run as -server"
+		doExit
+	}
+
+	putsLine "[-style reverse]type /help for help [-style none]"
+
+	putsPrompt
+	vwait forever
+}
+init $argv
